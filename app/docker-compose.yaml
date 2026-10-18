@@ -1,0 +1,62 @@
+version: '3.8'
+
+networks:
+  monitor-network:
+    driver: bridge
+
+volumes:
+  # Общее хранилище, через которое Nginx получит доступ к логам скрипта
+  shared-log-volume:
+  # Хранилище, через которое контейнер с Nginx получит сгенерированный сертификат
+  shared-certs-volume:
+
+services:
+  # Временный контейнер для генерации сертификата внутрь общего с monitor_nginx_web volumes
+  cert-generator:
+    image: alpine:3.19
+    container_name: monitor_cert_generator
+    # Установка openssl и генерация сертификата в облегчённом дистрибутиве
+    command: >
+      sh -c "apk add --no-cache openssl &&
+            mkdir -p /etc/nginx/certs &&
+            if [! -f /etc/nginx/certs/my-app.crt]; then
+              echo 'Генерация самоподписанного сертификата...' &&
+              openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+                -keyout /etc/nginx/certs/my-app.key \
+                -out /etc/nginx/certs/my-app.crt" \
+                -subj '/CN=my.app.local';
+            else
+              echo 'Сертификат уже существует';
+            fi"
+    volumes:
+      - shared-certs-volume:/etc/nginx/certs
+  monitor-script:
+    build: ./monitoring
+    container_name: monitor_script_worker
+    restart: always
+    volumes:
+      # Скрипт пишет лог в эту папку
+      - shared-log-volume:/var/log
+    networks:
+      - monitor-network
+    # Полная изоляция: порты наружу НЕ пробрасываем
+
+  nginx-frontend:
+    image: nginx:alpine
+    container_name: monitor_nginx_web
+    restart: always
+    ports:
+      - "8443:443"
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - shared-log-volume:/usr/share/nginx/html:ro
+      # Подключаем объем с сертификатами, созданными init-контейнером
+      - shared-certs-volume:/etc/nginx/certs:ro
+    networks:
+      - monitor-network
+    depends_on:
+      monitor-script:
+        condition: service_started
+      cert-generator:
+        condition: service_completed_successfully # Ждем, пока генератор успешно завершит работу
